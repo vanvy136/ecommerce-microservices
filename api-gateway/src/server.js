@@ -8,6 +8,7 @@ const morgan = require("morgan");
 
 const authRoutes = require("./routes/authRoutes");
 const customerRoutes = require("./routes/customerRoutes");
+const productRoutes = require("./routes/productRoutes");
 const authenticate = require("./middlewares/authenticate");
 const authorize = require("./middlewares/authorize");
 const {
@@ -43,7 +44,7 @@ app.use(generalLimiter);
 app.use("/auth", authLimiter, authRoutes);
 // Customer Service Proxy
 app.use("/customers", customerRoutes);
-
+app.use("/products", productRoutes);
 // JWT Authentication
 app.get("/gateway/me", authenticate, (req, res) => {
     res.json({
