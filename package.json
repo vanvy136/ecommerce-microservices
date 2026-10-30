@@ -1,0 +1,17 @@
+{
+  "name": "ecommerce-microservices",
+  "version": "1.0.0",
+  "description": "Ecommerce MVP using Microservices DDD and Database per Service",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo Run service tests individually"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "private": true
+}
