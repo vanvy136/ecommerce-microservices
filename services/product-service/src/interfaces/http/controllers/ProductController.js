@@ -291,3 +291,91 @@ exports.checkStock = async (req, res) => {
         });
     }
 };
+
+
+/**
+ * Atomic stock decrement.
+ *
+ * Chi tru ton kho khi:
+ * - San pham ton tai
+ * - San pham dang hoat dong
+ * - So luong ton kho du
+ *
+ * Luu y: Day la thao tac nguyen tu tren mot san pham,
+ * chua phai co che reservation/idempotency hoan chinh.
+ */
+exports.decreaseStock = async (req, res) => {
+    const { id } = req.params;
+    const { quantity } = req.body || {};
+
+    if (!validId(id)) {
+        return res.status(400).json({
+            success: false,
+            message: "Invalid product ID"
+        });
+    }
+
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: "Quantity must be a positive integer"
+        });
+    }
+
+    try {
+        const product = await Product.findOneAndUpdate(
+            {
+                _id: id,
+                isActive: true,
+                stock: { $gte: quantity }
+            },
+            {
+                $inc: { stock: -quantity }
+            },
+            {
+                new: true,
+                runValidators: true
+            }
+        );
+
+        if (!product) {
+            const existingProduct = await Product.findById(id);
+
+            if (!existingProduct) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Product not found"
+                });
+            }
+
+            if (!existingProduct.isActive) {
+                return res.status(409).json({
+                    success: false,
+                    message: "Product is inactive"
+                });
+            }
+
+            return res.status(409).json({
+                success: false,
+                message: "Insufficient product stock"
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: "Stock decreased successfully",
+            data: {
+                productId: product.id,
+                remainingStock: product.stock,
+                decreasedQuantity: quantity
+            }
+        });
+    } catch (error) {
+        console.error("Decrease stock error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Internal server error"
+        });
+    }
+};

@@ -8,6 +8,7 @@ const mongoose = require("mongoose");
 
 const connectMongoDB = require("./infrastructure/database/mongodb");
 const productRoutes = require("./interfaces/http/routes/productRoutes");
+const internalStockRoutes = require("./interfaces/http/routes/internalStockRoutes");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3103);
@@ -26,6 +27,7 @@ app.get("/health", (req, res) => {
 });
 
 app.use("/products", productRoutes);
+app.use("/internal/stock", internalStockRoutes);
 
 async function start() {
     await connectMongoDB();

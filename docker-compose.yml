@@ -1,4 +1,5 @@
-﻿name: ecommerce-microservices
+﻿
+name: ecommerce-microservices
 
 services:
   postgres:
@@ -24,12 +25,22 @@ services:
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    command:
+      - mongod
+      - --replSet
+      - rs0
+      - --bind_ip_all
+      - --keyFile
+      - /etc/mongodb-keyfile/mongodb-keyfile
     ports:
       - "127.0.0.1:27018:27017"
     volumes:
       - mongodb_data:/data/db
+      - ecommerce_mongodb_keyfile:/etc/mongodb-keyfile:ro
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.adminCommand({ping:1})' -u $$MONGO_INITDB_ROOT_USERNAME -p $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin"]
+      test:
+        - CMD-SHELL
+        - mongosh --quiet --eval 'db.adminCommand({ping:1})' -u $$MONGO_INITDB_ROOT_USERNAME -p $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin
       interval: 15s
       timeout: 10s
       retries: 5
@@ -73,3 +84,5 @@ volumes:
   mongodb_data:
   redis_data:
   kafka_data:
+  ecommerce_mongodb_keyfile:
+    external: true

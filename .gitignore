@@ -50,3 +50,15 @@ secrets/
 
 # Old source snapshots
 *.before-role.js
+
+# MongoDB backups
+backups/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Private keys
+*.key
+*.pem

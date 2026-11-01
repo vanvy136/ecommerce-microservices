@@ -1,0 +1,599 @@
+
+const pool = require("../database/pool");
+
+const RESERVATION_STATUSES = [
+  "pending",
+  "reserve_unknown",
+  "reserved",
+  "commit_unknown",
+  "committed",
+  "release_unknown",
+  "released",
+  "failed"
+];
+
+class OrderRepository {
+    
+  // 1. Tim don hang theo Idempotency-Key
+  async findByIdempotencyKey(customerId, idempotencyKey) {
+    const result = await pool.query(
+      `SELECT *
+       FROM orders
+       WHERE customer_id = $1
+         AND idempotency_key = $2`,
+      [customerId, idempotencyKey]
+    );
+
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    return this.getOrderWithItems(result.rows[0]);
+  }
+
+  // 2. Tim don hang theo ID
+  async findById(orderId) {
+    const result = await pool.query(
+      `SELECT *
+       FROM orders
+       WHERE id = $1`,
+      [orderId]
+    );
+
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    return this.getOrderWithItems(result.rows[0]);
+  }
+
+  // 3. Lay don hang kem chi tiet
+  async getOrderWithItems(order) {
+    const result = await pool.query(
+      `SELECT *
+       FROM order_items
+       WHERE order_id = $1
+       ORDER BY id`,
+      [order.id]
+    );
+
+    return {
+      ...order,
+      items: result.rows
+    };
+  }
+
+  
+  // 4. Doi soat Stock Reservation
+  async reconcileReservation(record) {
+    if (
+      !record ||
+      !record.reservation_id ||
+      !record.order_id ||
+      !record.product_id
+    ) {
+      throw new OrderError(
+        "Invalid stock reservation record",
+        500
+      );
+    }
+
+    const actual = await this.stockClient.getReservation(
+      record.reservation_id
+    );
+
+    if (!actual) {
+      return null;
+    }
+
+    if (
+      String(actual.orderId) !== String(record.order_id) ||
+      String(actual.productId) !== String(record.product_id) ||
+      Number(actual.quantity) !== Number(record.quantity)
+    ) {
+      throw new OrderError(
+        "Stock reservation data mismatch",
+        500
+      );
+    }
+
+    if (
+      !["reserved", "committed", "released"].includes(
+        actual.status
+      )
+    ) {
+      throw new OrderError(
+        "Unexpected stock reservation state",
+        502
+      );
+    }
+
+    await this.orderRepository.updateStockReservationStatus(
+      record.reservation_id,
+      actual.status
+    );
+
+    return actual;
+  }
+
+  // 4. Tao don hang va reservation trong transaction
+  async createOrder(orderData) {
+    const {
+      customerId,
+      items,
+      totalAmount,
+      idempotencyKey,
+      requestHash
+    } = orderData;
+
+    if (
+      typeof idempotencyKey !== "string" ||
+      idempotencyKey.length === 0 ||
+      idempotencyKey.length > 100
+    ) {
+      throw new Error("Invalid idempotency key");
+    }
+
+    if (
+      typeof requestHash !== "string" ||
+      !/^[a-f0-9]{64}$/i.test(requestHash)
+    ) {
+      throw new Error("Invalid request hash");
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error("Order items cannot be empty");
+    }
+
+    const productIds = new Set();
+
+    for (const item of items) {
+      if (
+        typeof item.productId !== "string" ||
+        !item.productId.trim()
+      ) {
+        throw new Error("Invalid product ID");
+      }
+
+      if (productIds.has(item.productId)) {
+        throw new Error("Duplicate product in order");
+      }
+
+      productIds.add(item.productId);
+
+      if (
+        !Number.isSafeInteger(item.quantity) ||
+        item.quantity <= 0
+      ) {
+        throw new Error("Invalid product quantity");
+      }
+    }
+
+    const client = await pool.connect();
+
+    let order;
+    let savedItems = [];
+    let alreadyExists = false;
+
+    try {
+      await client.query("BEGIN");
+
+      const orderResult = await client.query(
+        `INSERT INTO orders (
+          customer_id,
+          status,
+          total_amount,
+          idempotency_key,
+          request_hash,
+          processing_status
+        )
+        VALUES (
+          $1,
+          'pending',
+          $2,
+          $3,
+          $4,
+          'processing'
+        )
+        ON CONFLICT (customer_id, idempotency_key)
+        DO NOTHING
+        RETURNING *`,
+        [
+          customerId,
+          totalAmount,
+          idempotencyKey,
+          requestHash
+        ]
+      );
+
+      // Xu ly Idempotency-Key trung
+      if (orderResult.rows.length === 0) {
+        const existing = await client.query(
+          `SELECT *
+           FROM orders
+           WHERE customer_id = $1
+             AND idempotency_key = $2`,
+          [customerId, idempotencyKey]
+        );
+
+        if (existing.rows.length === 0) {
+          throw new Error(
+            "Unable to retrieve existing order"
+          );
+        }
+
+        order = existing.rows[0];
+
+        if (order.request_hash !== requestHash) {
+          const error = new Error(
+            "Idempotency key was used for another request"
+          );
+
+          error.status = 409;
+          throw error;
+        }
+
+        alreadyExists = true;
+      } else {
+        order = orderResult.rows[0];
+
+        // Luu order_items va reservation intent
+        for (const item of items) {
+          const itemResult = await client.query(
+            `INSERT INTO order_items (
+              order_id,
+              product_id,
+              product_name,
+              quantity,
+              unit_price,
+              subtotal
+            )
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING *`,
+            [
+              order.id,
+              item.productId,
+              item.productName,
+              item.quantity,
+              item.unitPrice,
+              item.subtotal
+            ]
+          );
+
+          savedItems.push(itemResult.rows[0]);
+
+          const reservationId =
+            `order:${order.id}:product:${item.productId}`;
+
+          await client.query(
+            `INSERT INTO order_stock_reservations (
+              order_id,
+              product_id,
+              reservation_id,
+              quantity,
+              status
+            )
+            VALUES ($1, $2, $3, $4, 'pending')`,
+            [
+              order.id,
+              item.productId,
+              reservationId,
+              item.quantity
+            ]
+          );
+        }
+      }
+
+      if (alreadyExists) {
+        const itemsResult = await client.query(
+          `SELECT *
+           FROM order_items
+           WHERE order_id = $1
+           ORDER BY id`,
+          [order.id]
+        );
+
+        savedItems = itemsResult.rows;
+      }
+
+      await client.query("COMMIT");
+
+      return {
+        ...order,
+        items: savedItems,
+        alreadyExists
+      };
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error(
+          "Order rollback failed:",
+          rollbackError.message
+        );
+      }
+
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  // 5. Tao Stock Reservation
+  async createStockReservation({
+    orderId,
+    productId,
+    reservationId,
+    quantity
+  }) {
+    const result = await pool.query(
+      `INSERT INTO order_stock_reservations (
+        order_id,
+        product_id,
+        reservation_id,
+        quantity,
+        status
+      )
+      VALUES ($1, $2, $3, $4, 'pending')
+      ON CONFLICT (order_id, product_id)
+      DO NOTHING
+      RETURNING *`,
+      [
+        orderId,
+        productId,
+        reservationId,
+        quantity
+      ]
+    );
+
+    if (result.rows.length > 0) {
+      return result.rows[0];
+    }
+
+    const existing = await pool.query(
+      `SELECT *
+       FROM order_stock_reservations
+       WHERE order_id = $1
+         AND product_id = $2`,
+      [orderId, productId]
+    );
+
+    const record = existing.rows[0];
+
+    if (
+      !record ||
+      record.reservation_id !== reservationId ||
+      Number(record.quantity) !== Number(quantity)
+    ) {
+      throw new Error("Stock reservation conflict");
+    }
+
+    return record;
+  }
+
+  // 6. Cap nhat trang thai reservation
+  async updateStockReservationStatus(
+    reservationId,
+    status,
+    lastError = null
+  ) {
+    if (!RESERVATION_STATUSES.includes(status)) {
+      throw new Error("Invalid reservation status");
+    }
+
+    const result = await pool.query(
+      `UPDATE order_stock_reservations
+       SET status = $2,
+           last_error = $3,
+           updated_at = NOW()
+       WHERE reservation_id = $1
+       RETURNING *`,
+      [
+        reservationId,
+        status,
+        lastError
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      throw new Error(
+        "Stock reservation not found"
+      );
+    }
+
+    return result.rows[0];
+  }
+
+  // 7. Lay reservation theo don hang
+  async getStockReservations(orderId) {
+    const result = await pool.query(
+      `SELECT *
+       FROM order_stock_reservations
+       WHERE order_id = $1
+       ORDER BY created_at, id`,
+      [orderId]
+    );
+
+    return result.rows;
+  }
+
+  // 8. Nhan quyen xu ly don hang
+  async acquireProcessingLease(orderId, ownerId) {
+    const result = await pool.query(
+      `UPDATE orders
+       SET processing_owner = $2,
+           processing_lease_until =
+             NOW() + INTERVAL '60 seconds',
+           processing_updated_at = NOW()
+       WHERE id = $1
+         AND processing_status NOT IN (
+           'completed',
+           'failed'
+         )
+         AND (
+           processing_owner IS NULL
+           OR processing_lease_until < NOW()
+         )
+       RETURNING *`,
+      [orderId, ownerId]
+    );
+
+    return result.rows[0] || null;
+  }
+
+  // 9. Gia han quyen xu ly
+  async renewProcessingLease(orderId, ownerId) {
+    const result = await pool.query(
+      `UPDATE orders
+       SET processing_lease_until =
+             NOW() + INTERVAL '60 seconds',
+           processing_updated_at = NOW()
+       WHERE id = $1
+         AND processing_owner = $2
+         AND processing_lease_until > NOW()
+         AND processing_status NOT IN (
+           'completed',
+           'failed'
+         )
+       RETURNING id`,
+      [orderId, ownerId]
+    );
+
+    return result.rowCount === 1;
+  }
+
+  // 10. Giai phong quyen xu ly
+  async releaseProcessingLease(orderId, ownerId) {
+    const result = await pool.query(
+      `UPDATE orders
+       SET processing_owner = NULL,
+           processing_lease_until = NULL,
+           processing_updated_at = NOW()
+       WHERE id = $1
+         AND processing_owner = $2
+       RETURNING id`,
+      [orderId, ownerId]
+    );
+
+    return result.rowCount === 1;
+  }
+
+
+  // 11. Cap nhat trang thai Order Saga + Transactional Outbox
+  async updateProcessingStatus(
+    orderId,
+    ownerId,
+    processingStatus,
+    orderStatus = null,
+    errorMessage = null
+  ) {
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const result = await client.query(
+        `UPDATE orders
+         SET processing_status = $3,
+             status = COALESCE($4, status),
+             processing_error = $5,
+             processing_updated_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $1
+           AND processing_owner = $2
+           AND processing_lease_until > NOW()
+         RETURNING *`,
+        [
+          orderId,
+          ownerId,
+          processingStatus,
+          orderStatus,
+          errorMessage
+        ]
+      );
+
+      const order = result.rows[0] || null;
+
+      if (
+        order &&
+        order.processing_status === "completed" &&
+        order.status === "confirmed"
+      ) {
+        const crypto = require("node:crypto");
+
+        const event = {
+          eventId: crypto.randomUUID(),
+          eventType: "order-created",
+          orderId: order.id,
+          customerId: order.customer_id,
+          status: order.status,
+          totalAmount: Number(order.total_amount),
+          occurredAt: new Date().toISOString()
+        };
+
+        await client.query(
+          `INSERT INTO order_outbox (
+             id,
+             order_id,
+             event_type,
+             topic,
+             payload
+           )
+           VALUES ($1, $2, $3, $4, $5::jsonb)
+           ON CONFLICT (order_id, event_type)
+           DO NOTHING`,
+          [
+            event.eventId,
+            order.id,
+            event.eventType,
+            "order-created",
+            JSON.stringify(event)
+          ]
+        );
+      }
+
+      await client.query("COMMIT");
+
+      return order;
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error(
+          "Order Outbox rollback failed:",
+          rollbackError.message
+        );
+      }
+
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+
+  // 12. Lay cac don hang can phuc hoi
+  async listRecoverableOrders(limit = 50) {
+    const result = await pool.query(
+      `SELECT id
+       FROM orders
+       WHERE processing_status NOT IN (
+         'completed',
+         'failed'
+       )
+         AND (
+           processing_owner IS NULL
+           OR processing_lease_until < NOW()
+         )
+       ORDER BY processing_updated_at ASC
+       LIMIT $1`,
+      [limit]
+    );
+
+    return result.rows;
+  }
+}
+
+module.exports = {
+  OrderRepository
+};

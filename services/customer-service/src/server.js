@@ -7,7 +7,9 @@ const helmet = require("helmet");
 const morgan = require("morgan");
 
 const customerRoutes = require("./interfaces/http/routes/customerRoutes");
-
+const internalCustomerRoutes = require(
+    "./interfaces/http/routes/internalCustomerRoutes"
+);
 const {
     startConsumer,
     stopConsumer
@@ -34,7 +36,7 @@ app.get("/health", (req, res) => {
 
 // Customer REST API
 app.use("/customers", customerRoutes);
-
+app.use("/internal/customers", internalCustomerRoutes);
 // Start Customer Service
 const server = app.listen(PORT, () => {
     console.log(`${SERVICE_NAME} running on port ${PORT}`);

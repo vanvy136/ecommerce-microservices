@@ -1,0 +1,1795 @@
+STEP 8 SOURCE REVIEW
+
+===== services/product-service/src/application/StockReservationService.js =====
+
+const mongoose = require("mongoose");
+
+const Product = require(
+  "../infrastructure/database/models/ProductModel"
+);
+
+const StockReservation = require(
+  "../infrastructure/database/models/StockReservationModel"
+);
+
+function createError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function validateReservationId(reservationId) {
+  if (
+    typeof reservationId !== "string" ||
+    reservationId.trim().length === 0 ||
+    reservationId.length > 100
+  ) {
+    throw createError("Invalid reservationId");
+  }
+}
+
+async function reserveStock({ reservationId, productId, quantity }) {
+  validateReservationId(reservationId);
+
+  if (!mongoose.isValidObjectId(productId)) {
+    throw createError("Invalid productId");
+  }
+
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+    throw createError("Quantity must be a positive integer");
+  }
+
+  const existing = await StockReservation.findOne({ reservationId });
+
+  if (existing) {
+    if (
+      String(existing.productId) !== String(productId) ||
+      existing.quantity !== quantity
+    ) {
+      throw createError("Reservation ID conflict", 409);
+    }
+
+    return {
+      reservation: existing,
+      alreadyExists: true
+    };
+  }
+
+  try {
+    const reservation = await mongoose.connection.transaction(
+      async (session) => {
+        const product = await Product.findOneAndUpdate(
+          {
+            _id: productId,
+            isActive: true,
+            stock: { $gte: quantity }
+          },
+          {
+            $inc: { stock: -quantity }
+          },
+          {
+            new: true,
+            session
+          }
+        );
+
+        if (!product) {
+          throw createError(
+            "Product unavailable or insufficient stock",
+            409
+          );
+        }
+
+        const created = await StockReservation.create(
+          [{
+            reservationId,
+            productId,
+            quantity,
+            status: "reserved",
+            reservedAt: new Date()
+          }],
+          { session }
+        );
+
+        return created[0];
+      }
+    );
+
+    return {
+      reservation,
+      alreadyExists: false
+    };
+  } catch (error) {
+    if (error.code === 11000) {
+      const existingReservation =
+        await StockReservation.findOne({ reservationId });
+
+      if (existingReservation) {
+        if (
+          String(existingReservation.productId) !== String(productId) ||
+          existingReservation.quantity !== quantity
+        ) {
+          throw createError("Reservation ID conflict", 409);
+        }
+
+        return {
+          reservation: existingReservation,
+          alreadyExists: true
+        };
+      }
+    }
+
+    throw error;
+  }
+}
+
+async function commitReservation(reservationId) {
+  validateReservationId(reservationId);
+
+  return mongoose.connection.transaction(async (session) => {
+    const reservation = await StockReservation.findOne({
+      reservationId
+    }).session(session);
+
+    if (!reservation) {
+      throw createError("Reservation not found", 404);
+    }
+
+    if (reservation.status === "committed") {
+      return reservation;
+    }
+
+    if (reservation.status !== "reserved") {
+      throw createError(
+        "Reservation cannot be committed",
+        409
+      );
+    }
+
+    reservation.status = "committed";
+    reservation.committedAt = new Date();
+
+    await reservation.save({ session });
+
+    return reservation;
+  });
+}
+
+async function releaseReservation(reservationId) {
+  validateReservationId(reservationId);
+
+  return mongoose.connection.transaction(async (session) => {
+    const reservation = await StockReservation.findOne({
+      reservationId
+    }).session(session);
+
+    if (!reservation) {
+      throw createError("Reservation not found", 404);
+    }
+
+    if (reservation.status === "released") {
+      return reservation;
+    }
+
+    if (reservation.status !== "reserved") {
+      throw createError(
+        "Reservation cannot be released",
+        409
+      );
+    }
+
+    await Product.updateOne(
+      { _id: reservation.productId },
+      { $inc: { stock: reservation.quantity } },
+      { session }
+    );
+
+    reservation.status = "released";
+    reservation.releasedAt = new Date();
+
+    await reservation.save({ session });
+
+    return reservation;
+  });
+}
+
+async function getReservation(reservationId) {
+  validateReservationId(reservationId);
+
+  const reservation = await StockReservation.findOne({
+    reservationId
+  });
+
+  if (!reservation) {
+    throw createError("Reservation not found", 404);
+  }
+
+  return reservation;
+}
+
+module.exports = {
+  reserveStock,
+  commitReservation,
+  releaseReservation,
+  getReservation
+};
+
+===== services/product-service/src/infrastructure/database/models/StockReservationModel.js =====
+
+const mongoose = require("mongoose");
+
+const stockReservationSchema = new mongoose.Schema(
+    {
+        reservationId: {
+            type: String,
+            required: true,
+            unique: true,
+            trim: true,
+            immutable: true
+        },
+
+        orderId: {
+            type: String,
+            default: null
+        },
+
+        productId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Product",
+            required: true,
+            immutable: true
+        },
+
+        quantity: {
+            type: Number,
+            required: true,
+            min: 1,
+            immutable: true,
+            validate: {
+                validator: Number.isSafeInteger,
+                message: "Quantity must be an integer"
+            }
+        },
+
+        status: {
+            type: String,
+            enum: [
+                "pending",
+                "reserved",
+                "released",
+                "committed"
+            ],
+            default: "pending"
+        },
+
+        reservedAt: {
+            type: Date,
+            default: null
+        },
+
+        releasedAt: {
+            type: Date,
+            default: null
+        },
+
+        committedAt: {
+            type: Date,
+            default: null
+        }
+    },
+    {
+        timestamps: true
+    }
+);
+
+stockReservationSchema.index({
+    productId: 1,
+    status: 1
+});
+
+module.exports = mongoose.model(
+    "StockReservation",
+    stockReservationSchema
+);
+
+===== services/product-service/src/infrastructure/database/models/ProductModel.js =====
+const mongoose = require("mongoose");
+
+const productSchema = new mongoose.Schema(
+    {
+        name: {
+            type: String,
+            required: true,
+            trim: true
+        },
+
+        description: {
+            type: String,
+            default: ""
+        },
+
+        price: {
+            type: Number,
+            required: true,
+            min: 0
+        },
+
+        stock: {
+            type: Number,
+            required: true,
+            min: 0,
+            default: 0,
+            validate: {
+                validator: Number.isInteger,
+                message: "Stock must be an integer"
+            }
+        },
+
+        category: {
+            type: String,
+            required: true,
+            trim: true
+        },
+
+        imageUrl: {
+            type: String,
+            default: ""
+        },
+
+        isActive: {
+            type: Boolean,
+            default: true
+        }
+    },
+    {
+        timestamps: true
+    }
+);
+
+productSchema.index({
+    name: "text",
+    description: "text"
+});
+
+productSchema.index({
+    category: 1
+});
+
+module.exports = mongoose.model("Product", productSchema);
+
+===== services/product-service/src/interfaces/http/controllers/ProductController.js =====
+
+const mongoose = require("mongoose");
+const Product = require("../../../infrastructure/database/models/ProductModel");
+
+function validId(id) {
+    return mongoose.isValidObjectId(id);
+}
+
+function validateProduct(body, partial = false) {
+    const allowed = [
+        "name", "description", "price",
+        "stock", "category", "imageUrl", "isActive"
+    ];
+
+    const data = {};
+
+    for (const key of allowed) {
+        if (Object.prototype.hasOwnProperty.call(body, key)) {
+            data[key] = body[key];
+        }
+    }
+
+    if (!partial || "name" in data) {
+        if (typeof data.name !== "string" || !data.name.trim()) {
+            throw new Error("Valid name is required");
+        }
+    }
+
+    if (!partial || "category" in data) {
+        if (typeof data.category !== "string" || !data.category.trim()) {
+            throw new Error("Valid category is required");
+        }
+    }
+
+    if (!partial || "price" in data) {
+        if (typeof data.price !== "number" ||
+            !Number.isFinite(data.price) || data.price < 0) {
+            throw new Error("Price must be a non-negative number");
+        }
+    }
+
+    if (!partial || "stock" in data) {
+        if (!Number.isInteger(data.stock) || data.stock < 0) {
+            throw new Error("Stock must be a non-negative integer");
+        }
+    }
+
+    if ("isActive" in data && typeof data.isActive !== "boolean") {
+        throw new Error("isActive must be boolean");
+    }
+
+    for (const key of ["description", "imageUrl"]) {
+        if (key in data && typeof data[key] !== "string") {
+            throw new Error(`${key} must be a string`);
+        }
+    }
+
+    return data;
+}
+
+// CREATE
+exports.createProduct = async (req, res) => {
+    try {
+        const data = validateProduct(req.body);
+        const product = await Product.create(data);
+
+        return res.status(201).json({
+            success: true,
+            message: "Product created successfully",
+            data: product
+        });
+    } catch (error) {
+        return res.status(400).json({
+            success: false,
+            message: error.message
+        });
+    }
+};
+
+// READ ALL + SEARCH + FILTER + PAGINATION
+exports.getProducts = async (req, res) => {
+    try {
+        const page = Number(req.query.page || 1);
+        const limit = Number(req.query.limit || 10);
+
+        if (!Number.isSafeInteger(page) || page < 1 ||
+            !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid pagination parameters"
+            });
+        }
+
+        const filter = {};
+
+        if (req.query.category) {
+            filter.category = req.query.category;
+        }
+
+        if (req.query.search) {
+            filter.$text = { $search: req.query.search };
+        }
+
+        if (req.query.isActive !== undefined) {
+            if (!["true", "false"].includes(req.query.isActive)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid isActive value"
+                });
+            }
+            filter.isActive = req.query.isActive === "true";
+        }
+
+        const [products, total] = await Promise.all([
+            Product.find(filter)
+                .sort({ createdAt: -1, _id: -1 })
+                .skip((page - 1) * limit)
+                .limit(limit),
+            Product.countDocuments(filter)
+        ]);
+
+        return res.json({
+            success: true,
+            data: products,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit)
+            }
+        });
+    } catch (error) {
+        return res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+};
+
+// READ BY ID
+exports.getProductById = async (req, res) => {
+    if (!validId(req.params.id)) {
+        return res.status(400).json({
+            success: false,
+            message: "Invalid product ID"
+        });
+    }
+
+    try {
+        const product = await Product.findById(req.params.id);
+
+        if (!product) {
+            return res.status(404).json({
+                success: false,
+                message: "Product not found"
+            });
+        }
+
+        return res.json({ success: true, data: product });
+    } catch (error) {
+        return res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+};
+
+// UPDATE
+exports.updateProduct = async (req, res) => {
+    if (!validId(req.params.id)) {
+        return res.status(400).json({
+            success: false,
+            message: "Invalid product ID"
+        });
+    }
+
+    try {
+        const data = validateProduct(req.body, true);
+
+        if (Object.keys(data).length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "No valid fields to update"
+            });
+        }
+
+        const product = await Product.findByIdAndUpdate(
+            req.params.id,
+            { $set: data },
+            { new: true, runValidators: true }
+        );
+
+        if (!product) {
+            return res.status(404).json({
+                success: false,
+                message: "Product not found"
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: "Product updated successfully",
+            data: product
+        });
+    } catch (error) {
+        return res.status(400).json({
+            success: false,
+            message: error.message
+        });
+    }
+};
+
+// SOFT DELETE
+exports.deleteProduct = async (req, res) => {
+    if (!validId(req.params.id)) {
+        return res.status(400).json({
+            success: false,
+            message: "Invalid product ID"
+        });
+    }
+
+    try {
+        const product = await Product.findByIdAndUpdate(
+            req.params.id,
+            { isActive: false },
+            { new: true }
+        );
+
+        if (!product) {
+            return res.status(404).json({
+                success: false,
+                message: "Product not found"
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: "Product deactivated successfully",
+            data: product
+        });
+    } catch (error) {
+        return res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+};
+
+// CHECK STOCK
+exports.checkStock = async (req, res) => {
+    if (!validId(req.params.id)) {
+        return res.status(400).json({
+            success: false,
+            message: "Invalid product ID"
+        });
+    }
+
+    const quantity = Number(req.query.quantity);
+
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: "Quantity must be a positive integer"
+        });
+    }
+
+    try {
+        const product = await Product.findById(req.params.id);
+
+        if (!product) {
+            return res.status(404).json({
+                success: false,
+                message: "Product not found"
+            });
+        }
+
+        return res.json({
+            success: true,
+            data: {
+                productId: product.id,
+                stock: product.stock,
+                requestedQuantity: quantity,
+                available: product.isActive &&
+                    product.stock >= quantity
+            }
+        });
+    } catch (error) {
+        return res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+};
+
+
+/**
+ * Atomic stock decrement.
+ *
+ * Chi tru ton kho khi:
+ * - San pham ton tai
+ * - San pham dang hoat dong
+ * - So luong ton kho du
+ *
+ * Luu y: Day la thao tac nguyen tu tren mot san pham,
+ * chua phai co che reservation/idempotency hoan chinh.
+ */
+exports.decreaseStock = async (req, res) => {
+    const { id } = req.params;
+    const { quantity } = req.body || {};
+
+    if (!validId(id)) {
+        return res.status(400).json({
+            success: false,
+            message: "Invalid product ID"
+        });
+    }
+
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: "Quantity must be a positive integer"
+        });
+    }
+
+    try {
+        const product = await Product.findOneAndUpdate(
+            {
+                _id: id,
+                isActive: true,
+                stock: { $gte: quantity }
+            },
+            {
+                $inc: { stock: -quantity }
+            },
+            {
+                new: true,
+                runValidators: true
+            }
+        );
+
+        if (!product) {
+            const existingProduct = await Product.findById(id);
+
+            if (!existingProduct) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Product not found"
+                });
+            }
+
+            if (!existingProduct.isActive) {
+                return res.status(409).json({
+                    success: false,
+                    message: "Product is inactive"
+                });
+            }
+
+            return res.status(409).json({
+                success: false,
+                message: "Insufficient product stock"
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: "Stock decreased successfully",
+            data: {
+                productId: product.id,
+                remainingStock: product.stock,
+                decreasedQuantity: quantity
+            }
+        });
+    } catch (error) {
+        console.error("Decrease stock error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Internal server error"
+        });
+    }
+};
+
+===== services/product-service/src/interfaces/http/routes/productRoutes.js =====
+const express = require("express");
+const controller = require("../controllers/ProductController");
+
+const router = express.Router();
+
+router.post("/", controller.createProduct);
+router.get("/", controller.getProducts);
+router.get("/:id", controller.getProductById);
+router.patch("/:id", controller.updateProduct);
+router.delete("/:id", controller.deleteProduct);
+router.get("/:id/stock", controller.checkStock);
+router.post("/:id/stock/decrease", controller.decreaseStock);
+module.exports = router;
+
+===== services/product-service/src/interfaces/http/controllers/StockReservationController.js =====
+
+const StockReservationService = require(
+    "../../../application/StockReservationService"
+);
+
+function handleError(res, error) {
+    console.error("Stock Reservation Error:", error.message);
+
+    const status = Number.isInteger(error.status)
+        ? error.status
+        : 500;
+
+    return res.status(status).json({
+        success: false,
+        message: status === 500
+            ? "Internal server error"
+            : error.message
+    });
+}
+
+async function reserve(req, res) {
+    try {
+        const {
+            reservationId,
+            productId,
+            quantity
+        } = req.body;
+
+        const result = await StockReservationService.reserveStock({
+            reservationId,
+            productId,
+            quantity
+        });
+
+        return res.status(result.alreadyExists ? 200 : 201).json({
+            success: true,
+            message: result.alreadyExists
+                ? "Reservation already exists"
+                : "Stock reserved successfully",
+            data: result.reservation
+        });
+    } catch (error) {
+        return handleError(res, error);
+    }
+}
+
+async function commit(req, res) {
+    try {
+        const { reservationId } = req.body;
+
+        const reservation =
+            await StockReservationService.commitReservation(
+                reservationId
+            );
+
+        return res.status(200).json({
+            success: true,
+            message: "Reservation committed",
+            data: reservation
+        });
+    } catch (error) {
+        return handleError(res, error);
+    }
+}
+
+async function release(req, res) {
+    try {
+        const { reservationId } = req.body;
+
+        const reservation =
+            await StockReservationService.releaseReservation(
+                reservationId
+            );
+
+        return res.status(200).json({
+            success: true,
+            message: "Reservation released",
+            data: reservation
+        });
+    } catch (error) {
+        return handleError(res, error);
+    }
+}
+
+async function getById(req, res) {
+    try {
+        const reservation =
+            await StockReservationService.getReservation(
+                req.params.id
+            );
+
+        return res.status(200).json({
+            success: true,
+            data: reservation
+        });
+    } catch (error) {
+        return handleError(res, error);
+    }
+}
+
+module.exports = {
+    reserve,
+    commit,
+    release,
+    getById
+};
+
+===== services/product-service/src/interfaces/http/routes/internalStockRoutes.js =====
+
+const express = require("express");
+const crypto = require("node:crypto");
+
+const controller = require(
+    "../controllers/StockReservationController"
+);
+
+const router = express.Router();
+
+router.use((req, res, next) => {
+    const expected = process.env.INTERNAL_SERVICE_KEY;
+    const provided = req.get("x-internal-service-key");
+
+    if (!expected || !provided) {
+        return res.status(401).json({
+            success: false,
+            message: "Unauthorized internal request"
+        });
+    }
+
+    const a = Buffer.from(expected);
+    const b = Buffer.from(provided);
+
+    if (
+        a.length !== b.length ||
+        !crypto.timingSafeEqual(a, b)
+    ) {
+        return res.status(401).json({
+            success: false,
+            message: "Unauthorized internal request"
+        });
+    }
+
+    next();
+});
+
+router.post("/reserve", controller.reserve);
+router.post("/commit", controller.commit);
+router.post("/release", controller.release);
+router.get("/reservations/:id", controller.getById);
+
+module.exports = router;
+
+===== services/product-service/src/server.js =====
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const helmet = require("helmet");
+const morgan = require("morgan");
+const mongoose = require("mongoose");
+
+const connectMongoDB = require("./infrastructure/database/mongodb");
+const productRoutes = require("./interfaces/http/routes/productRoutes");
+const internalStockRoutes = require("./interfaces/http/routes/internalStockRoutes");
+
+const app = express();
+const PORT = Number(process.env.PORT || 3103);
+
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+app.use(morgan("dev"));
+
+app.get("/health", (req, res) => {
+    res.status(200).json({
+        status: "ok",
+        service: "product-service",
+        timestamp: new Date().toISOString()
+    });
+});
+
+app.use("/products", productRoutes);
+app.use("/internal/stock", internalStockRoutes);
+
+async function start() {
+    await connectMongoDB();
+
+    const server = app.listen(PORT, () => {
+        console.log(`product-service running on port ${PORT}`);
+    });
+
+    async function shutdown(signal) {
+        console.log(`${signal} received`);
+        server.close(async () => {
+            await mongoose.disconnect();
+            process.exit(0);
+        });
+    }
+
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+}
+
+start().catch(error => {
+    console.error("Product Service startup failed:", error.message);
+    process.exit(1);
+});
+
+===== services/order-service/src/application/OrderService.js =====
+
+const axios = require("axios");
+const crypto = require("node:crypto");
+const { OrderRepository } = require(
+  "../infrastructure/repositories/OrderRepository"
+);
+
+const CART_SERVICE_URL = process.env.CART_SERVICE_URL;
+const PRODUCT_SERVICE_URL = process.env.PRODUCT_SERVICE_URL;
+
+class OrderError extends Error {
+  constructor(message, status = 400) {
+    super(message);
+    this.name = "OrderError";
+    this.status = status;
+  }
+}
+
+class OrderService {
+  constructor() {
+    this.orderRepository = new OrderRepository();
+  }
+
+  // 1. Lay gio hang tu Cart Service
+  async getCart(userId) {
+    if (!CART_SERVICE_URL) {
+      throw new OrderError(
+        "CART_SERVICE_URL is not configured",
+        500
+      );
+    }
+
+    try {
+      const response = await axios.get(
+        `${CART_SERVICE_URL}/cart`,
+        {
+          headers: {
+            "x-user-id": userId
+          },
+          timeout: 5000
+        }
+      );
+
+      const cart = response.data?.data;
+
+      if (
+        !cart ||
+        cart.userId !== userId ||
+        !Array.isArray(cart.items)
+      ) {
+        throw new OrderError(
+          "Invalid Cart Service response",
+          502
+        );
+      }
+
+      return cart;
+    } catch (error) {
+      if (error instanceof OrderError) {
+        throw error;
+      }
+
+      throw new OrderError(
+        "Cart Service unavailable",
+        502
+      );
+    }
+  }
+
+  // 2. Lay thong tin san pham tu Product Service
+  async getProduct(productId) {
+    if (!PRODUCT_SERVICE_URL) {
+      throw new OrderError(
+        "PRODUCT_SERVICE_URL is not configured",
+        500
+      );
+    }
+
+    try {
+      const response = await axios.get(
+        `${PRODUCT_SERVICE_URL}/products/${encodeURIComponent(productId)}`,
+        {
+          timeout: 5000
+        }
+      );
+
+      const product = response.data?.data;
+
+      if (!product || !product._id) {
+        throw new OrderError(
+          "Invalid Product Service response",
+          502
+        );
+      }
+
+      return product;
+    } catch (error) {
+      if (error instanceof OrderError) {
+        throw error;
+      }
+
+      if (error.response?.status === 404) {
+        throw new OrderError(
+          "Product not found",
+          404
+        );
+      }
+
+      throw new OrderError(
+        "Product Service unavailable",
+        502
+      );
+    }
+  }
+
+  // 3. Kiem tra va chuan bi du lieu don hang
+  async prepareOrder(userId) {
+    const cart = await this.getCart(userId);
+
+    if (cart.items.length === 0) {
+      throw new OrderError(
+        "Cart is empty",
+        400
+      );
+    }
+
+    const items = [];
+    let totalAmount = 0;
+
+    for (const cartItem of cart.items) {
+      if (
+        !cartItem ||
+        typeof cartItem.productId !== "string" ||
+        !cartItem.productId.trim()
+      ) {
+        throw new OrderError(
+          "Invalid product ID in cart",
+          400
+        );
+      }
+
+      const quantity = cartItem.quantity;
+
+      if (
+        !Number.isSafeInteger(quantity) ||
+        quantity <= 0
+      ) {
+        throw new OrderError(
+          "Invalid product quantity",
+          400
+        );
+      }
+
+      const product = await this.getProduct(
+        cartItem.productId
+      );
+
+      if (product.isActive === false) {
+        throw new OrderError(
+          "Product is inactive",
+          409
+        );
+      }
+
+      if (
+        !Number.isSafeInteger(product.stock) ||
+        product.stock < quantity
+      ) {
+        throw new OrderError(
+          "Insufficient product stock",
+          409
+        );
+      }
+
+      const price = product.price;
+
+      if (
+        typeof price !== "number" ||
+        !Number.isSafeInteger(price) ||
+        price < 0
+      ) {
+        throw new OrderError(
+          "Invalid product price",
+          502
+        );
+      }
+
+      if (
+        typeof product.name !== "string" ||
+        !product.name.trim()
+      ) {
+        throw new OrderError(
+          "Invalid product name",
+          502
+        );
+      }
+
+      const subtotal = price * quantity;
+
+      if (!Number.isSafeInteger(subtotal)) {
+        throw new OrderError(
+          "Invalid order subtotal",
+          400
+        );
+      }
+
+      items.push({
+        productId: String(product._id),
+        productName: product.name,
+        quantity,
+        unitPrice: price,
+        subtotal
+      });
+
+      totalAmount += subtotal;
+
+      if (!Number.isSafeInteger(totalAmount)) {
+        throw new OrderError(
+          "Invalid order total",
+          400
+        );
+      }
+    }
+
+    return {
+      customerId: userId,
+      items,
+      totalAmount
+    };
+  }
+
+  // 4. Tao don hang va luu vao PostgreSQL
+  
+async createOrder(userId, idempotencyKey, requestBody = {}) {
+  const uuidPattern =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+  if (
+    typeof userId !== "string" ||
+    !uuidPattern.test(userId)
+  ) {
+    throw new OrderError(
+      "Invalid authenticated user ID",
+      401
+    );
+  }
+
+  if (
+    typeof idempotencyKey !== "string" ||
+    !uuidPattern.test(idempotencyKey)
+  ) {
+    throw new OrderError(
+      "A valid UUID Idempotency-Key is required",
+      400
+    );
+  }
+
+  // Hien tai API dat hang chi chap nhan body rong.
+  // Thong tin san pham va gia se lay tu cac service.
+  if (
+    !requestBody ||
+    typeof requestBody !== "object" ||
+    Array.isArray(requestBody) ||
+    Object.keys(requestBody).length !== 0
+  ) {
+    throw new OrderError(
+      "Order request body must be empty",
+      400
+    );
+  }
+
+  // Hash tu yeu cau bat bien, khong phu thuoc gio hang.
+  // Nho do retry van nhan ra don hang cu sau khi xoa cart.
+  const requestHash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify({
+      version: 1,
+      customerId: userId,
+      operation: "create-order",
+      body: {}
+    }))
+    .digest("hex");
+
+  const existingOrder =
+    await this.orderRepository.findByIdempotencyKey(
+      userId,
+      idempotencyKey
+    );
+
+  if (existingOrder) {
+    if (existingOrder.request_hash !== requestHash) {
+      throw new OrderError(
+        "Idempotency key was used for another request",
+        409
+      );
+    }
+
+    return {
+      ...existingOrder,
+      alreadyExists: true
+    };
+  }
+
+  const orderData = await this.prepareOrder(userId);
+
+  return this.orderRepository.createOrder({
+    ...orderData,
+    idempotencyKey,
+    requestHash
+  });
+}
+
+}
+
+module.exports = {
+  OrderService,
+  OrderError
+};
+
+===== services/order-service/src/infrastructure/repositories/OrderRepository.js =====
+
+const pool = require("../database/pool");
+
+class OrderRepository {
+  // Tim don hang theo Customer va Idempotency-Key
+  async findByIdempotencyKey(customerId, idempotencyKey) {
+    const result = await pool.query(
+      `SELECT *
+       FROM orders
+       WHERE customer_id = $1
+         AND idempotency_key = $2`,
+      [customerId, idempotencyKey]
+    );
+
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    const order = result.rows[0];
+
+    const itemsResult = await pool.query(
+      `SELECT *
+       FROM order_items
+       WHERE order_id = $1
+       ORDER BY id`,
+      [order.id]
+    );
+
+    return {
+      ...order,
+      items: itemsResult.rows
+    };
+  }
+
+  // Tao don hang trong transaction PostgreSQL
+  async createOrder(orderData) {
+    const {
+      customerId,
+      items,
+      totalAmount,
+      idempotencyKey,
+      requestHash
+    } = orderData;
+
+    if (
+      typeof idempotencyKey !== "string" ||
+      idempotencyKey.length < 1 ||
+      idempotencyKey.length > 100
+    ) {
+      throw new Error("Invalid idempotency key");
+    }
+
+    if (
+      typeof requestHash !== "string" ||
+      !/^[a-f0-9]{64}$/i.test(requestHash)
+    ) {
+      throw new Error("Invalid request hash");
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error("Order items cannot be empty");
+    }
+
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const orderResult = await client.query(
+        `INSERT INTO orders (
+          customer_id,
+          status,
+          total_amount,
+          idempotency_key,
+          request_hash
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (customer_id, idempotency_key)
+        DO NOTHING
+        RETURNING *`,
+        [
+          customerId,
+          "pending",
+          totalAmount,
+          idempotencyKey,
+          requestHash
+        ]
+      );
+
+      // PostgreSQL da phat hien khoa trung.
+      if (orderResult.rows.length === 0) {
+        await client.query("COMMIT");
+
+        const existingOrder =
+          await this.findByIdempotencyKey(
+            customerId,
+            idempotencyKey
+          );
+
+        if (!existingOrder) {
+          throw new Error(
+            "Unable to retrieve existing order"
+          );
+        }
+
+        if (existingOrder.request_hash !== requestHash) {
+          const error = new Error(
+            "Idempotency key was used for another request"
+          );
+
+          error.status = 409;
+          throw error;
+        }
+
+        return {
+          ...existingOrder,
+          alreadyExists: true
+        };
+      }
+
+      const order = orderResult.rows[0];
+      const savedItems = [];
+
+      for (const item of items) {
+        const itemResult = await client.query(
+          `INSERT INTO order_items (
+            order_id,
+            product_id,
+            product_name,
+            quantity,
+            unit_price,
+            subtotal
+          )
+          VALUES ($1, $2, $3, $4, $5, $6)
+          RETURNING *`,
+          [
+            order.id,
+            item.productId,
+            item.productName,
+            item.quantity,
+            item.unitPrice,
+            item.subtotal
+          ]
+        );
+
+        savedItems.push(itemResult.rows[0]);
+      }
+
+      await client.query("COMMIT");
+
+      return {
+        ...order,
+        items: savedItems,
+        alreadyExists: false
+      };
+    } catch (error) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error(
+          "Order rollback failed:",
+          rollbackError.message
+        );
+      }
+
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+}
+
+module.exports = {
+  OrderRepository
+};
+
+===== services/order-service/src/interfaces/http/controllers/OrderController.js =====
+
+const { OrderService, OrderError } = require(
+  "../../../application/OrderService"
+);
+
+const orderService = new OrderService();
+
+function getUserId(req) {
+  const userId = req.headers["x-user-id"];
+
+  if (
+    typeof userId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(userId)
+  ) {
+    throw new OrderError(
+      "Missing or invalid authenticated user",
+      401
+    );
+  }
+
+  return userId;
+}
+
+function handleError(res, error) {
+  const status = error instanceof OrderError
+    ? error.status
+    : 500;
+
+  if (status >= 500) {
+    console.error("Order error:", error);
+  }
+
+  return res.status(status).json({
+    success: false,
+    message: status === 500
+      ? "Internal server error"
+      : error.message
+  });
+}
+
+async function createOrder(req, res) {
+  try {
+    const userId = getUserId(req);
+
+    const order = await orderService.createOrder(userId);
+
+    return res.status(201).json({
+      success: true,
+      message: "Order created successfully",
+      data: order
+    });
+  } catch (error) {
+    return handleError(res, error);
+  }
+}
+
+module.exports = {
+  createOrder
+};
+
+===== services/order-service/src/interfaces/http/routes/orderRoutes.js =====
+
+const express = require("express");
+
+const router = express.Router();
+
+// Tam khoa chuc nang tao don hang.
+// Chi kich hoat sau khi hoan thien:
+// 1. Xac thuc
+// 2. Chong tao don trung
+// 3. Kiem soat ton kho
+router.post("/", (req, res) => {
+  return res.status(503).json({
+    success: false,
+    message: "Order creation is not enabled yet"
+  });
+});
+
+module.exports = router;
+
+===== services/order-service/src/server.js =====
+
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const helmet = require("helmet");
+const morgan = require("morgan");
+
+const pool = require("./infrastructure/database/pool");
+const orderRoutes = require("./interfaces/http/routes/orderRoutes");
+
+const app = express();
+const PORT = Number(process.env.PORT || 3105);
+
+app.disable("x-powered-by");
+
+app.use(helmet());
+app.use(cors());
+app.use(morgan("dev"));
+app.use(express.json());
+
+// Health check
+app.get("/health", async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+
+    return res.json({
+      status: "ok",
+      service: "order-service",
+      database: "connected"
+    });
+  } catch (error) {
+    console.error("Health check failed:", error.message);
+
+    return res.status(503).json({
+      status: "error",
+      service: "order-service",
+      database: "disconnected"
+    });
+  }
+});
+
+// Order API
+app.use("/orders", orderRoutes);
+
+// Route khong ton tai
+app.use((req, res) => {
+  return res.status(404).json({
+    success: false,
+    message: "Route not found"
+  });
+});
+
+// Xu ly loi chung
+app.use((err, req, res, next) => {
+  console.error("Order Service error:", err.message);
+
+  return res.status(500).json({
+    success: false,
+    message: "Internal server error"
+  });
+});
+
+async function start() {
+  try {
+    await pool.query("SELECT 1");
+
+    console.log("PostgreSQL connected successfully");
+
+    app.listen(PORT, "127.0.0.1", () => {
+      console.log(
+        `Order Service running on http://127.0.0.1:${PORT}`
+      );
+    });
+  } catch (error) {
+    console.error("Startup failed:", error.message);
+    process.exit(1);
+  }
+}
+
+start();
+
+===== api-gateway/src/routes/orderRoutes.js =====
+
+const express = require("express");
+const { createProxyMiddleware } = require("http-proxy-middleware");
+
+const authenticate = require("../middlewares/authenticate");
+const authorize = require("../middlewares/authorize");
+
+const router = express.Router();
+
+const target = process.env.ORDER_SERVICE_URL;
+
+if (!target) {
+  throw new Error("ORDER_SERVICE_URL is not configured");
+}
+
+// Tat ca Order API hien tai chi danh cho Customer.
+router.use(authenticate);
+router.use(authorize("customer"));
+
+// Loai bo header danh tinh do client tu gui.
+router.use((req, res, next) => {
+  delete req.headers["x-user-id"];
+  next();
+});
+
+router.use(
+  createProxyMiddleware({
+    target,
+    changeOrigin: true,
+
+    pathRewrite: (path) => {
+      return path.startsWith("/orders")
+        ? path
+        : `/orders${path}`;
+    },
+
+    on: {
+      proxyReq: (proxyReq, req) => {
+        proxyReq.setHeader("x-user-id", req.user.id);
+      },
+
+      error: (error, req, res) => {
+        console.error("Order proxy error:", error.message);
+
+        if (!res.headersSent) {
+          res.writeHead(502, {
+            "Content-Type": "application/json"
+          });
+        }
+
+        res.end(
+          JSON.stringify({
+            success: false,
+            message: "Order Service unavailable"
+          })
+        );
+      }
+    }
+  })
+);
+
+module.exports = router;
+
+
+===== api-gateway/src/server.js =====
+
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const helmet = require("helmet");
+const morgan = require("morgan");
+
+const authRoutes = require("./routes/authRoutes");
+const customerRoutes = require("./routes/customerRoutes");
+const productRoutes = require("./routes/productRoutes");
+const cartRoutes = require("./routes/cartRoutes");
+const orderRoutes = require("./routes/orderRoutes");
+const authenticate = require("./middlewares/authenticate");
+const authorize = require("./middlewares/authorize");
+const {
+    generalLimiter,
+    authLimiter
+} = require("./middlewares/rateLimiter");
+
+const redisClient = require("./redis/client");
+const cacheResponse = require("./middlewares/cacheResponse");
+
+const app = express();
+const PORT = Number(process.env.PORT || 3100);
+
+app.disable("x-powered-by");
+
+app.use(helmet());
+app.use(cors());
+app.use(morgan("dev"));
+
+app.get("/health", (req, res) => {
+    res.json({
+        status: "ok",
+        service: "api-gateway",
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Rate limiting cho các API
+app.use(generalLimiter);
+
+// Proxy ph?i du?c d?t tru?c express.json()
+// d? gi? nguyên body khi chuy?n ti?p POST request.
+app.use("/auth", authLimiter, authRoutes);
+// Customer Service Proxy
+app.use("/customers", customerRoutes);
+app.use("/products", productRoutes);
+app.use("/cart", cartRoutes);
+app.use("/orders", orderRoutes);
+// JWT Authentication
+app.get("/gateway/me", authenticate, (req, res) => {
+    res.json({
+        success: true,
+        data: req.user
+    });
+});
+
+// Authorization: ch? admin
+app.get(
+    "/gateway/admin",
+    authenticate,
+    authorize("admin"),
+    (req, res) => {
+        res.json({
+            success: true,
+            message: "Admin access granted"
+        });
+    }
+);
+
+// Public endpoint dùng Redis Cache
+app.get("/gateway/public-info", cacheResponse, (req, res) => {
+    res.json({
+        success: true,
+        service: "api-gateway",
+        generatedAt: new Date().toISOString()
+    });
+});
+
+app.use((req, res) => {
+    res.status(404).json({
+        success: false,
+        message: "Route not found"
+    });
+});
+
+async function start() {
+    try {
+        await redisClient.connect();
+        console.log("Redis connected");
+    } catch (error) {
+        console.error("Redis unavailable:", error.message);
+    }
+
+    app.listen(PORT, () => {
+        console.log(`api-gateway running on port ${PORT}`);
+    });
+}
+
+start();

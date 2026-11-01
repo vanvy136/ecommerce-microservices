@@ -10,6 +10,8 @@ const authRoutes = require("./routes/authRoutes");
 const customerRoutes = require("./routes/customerRoutes");
 const productRoutes = require("./routes/productRoutes");
 const cartRoutes = require("./routes/cartRoutes");
+const orderRoutes = require("./routes/orderRoutes");
+const shipmentRoutes = require("./routes/shipmentRoutes");
 const authenticate = require("./middlewares/authenticate");
 const authorize = require("./middlewares/authorize");
 const {
@@ -47,6 +49,10 @@ app.use("/auth", authLimiter, authRoutes);
 app.use("/customers", customerRoutes);
 app.use("/products", productRoutes);
 app.use("/cart", cartRoutes);
+app.use("/orders", orderRoutes);
+app.use("/cart", cartRoutes);
+app.use("/orders", orderRoutes);
+app.use("/shipments", shipmentRoutes);
 // JWT Authentication
 app.get("/gateway/me", authenticate, (req, res) => {
     res.json({
